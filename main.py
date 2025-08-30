@@ -1,133 +1,238 @@
-import os, asyncio, time, csv, json, tarfile, datetime, io, requests
+import asyncio
+from typing import Union
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
-from aiogram.filters import Command
-from pyairtable import Table
-from dotenv import load_dotenv
-import schedule
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-load_dotenv()
+from config import settings
+from airtable import Airtable, get_menu_items, ensure_client, create_sale
+from payment import CashPayment, QRStaticPayment
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
-AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
-AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
-AIRTABLE_TABLE_SALES = os.environ.get("AIRTABLE_TABLE_SALES","sales")
-MENU_PRESETS = [x.strip() for x in os.environ.get("MENU_PRESETS","").split(",") if x.strip()]
-BACKUP_TABLES = [x.strip() for x in os.environ.get("BACKUP_TABLES", AIRTABLE_TABLE_SALES).split(",")]
-BACKUP_CRON = os.environ.get("BACKUP_CRON","0 3 * * *").strip()
+CART: dict[int, dict[str, dict]] = {}
+PAGE_SIZE = 4
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+def page_slice(items, page, page_size=PAGE_SIZE):
+    start = page * page_size
+    end = start + page_size
+    return items[start:end], len(items)
 
-sales_tbl = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_SALES)
+def item_kb(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить", callback_data=f"add:{item_id}")],
+        [InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")]
+    ])
 
-def menu_kb():
-    if not MENU_PRESETS: return None
-    rows, row = [], []
-    for item in MENU_PRESETS:
-        if ";" in item:
-            name, price = item.split(";",1)
+def qty_kb(item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="−", callback_data=f"dec:{item_id}"),
+         InlineKeyboardButton(text="+", callback_data=f"qty:{item_id}")],
+        [InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")]
+    ])
+
+def pager_kb(page: int, total_items: int) -> InlineKeyboardMarkup:
+    pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE if total_items else 1
+    left = InlineKeyboardButton(text="⏮", callback_data=f"page:{max(page-1,0)}")
+    right = InlineKeyboardButton(text="⏭", callback_data=f"page:{min(page+1,pages-1)}")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [left, right],
+        [InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")]
+    ])
+
+def cart_total(cart: dict) -> float:
+    return sum(v["price"] * v["qty"] for v in cart.values())
+
+async def on_start(message: Message, at: Airtable):
+    await ensure_client(
+        at,
+        message.from_user.id,
+        message.from_user.full_name or "",
+        message.from_user.username or "",
+    )
+    await message.answer("Привет! Я помогу оформить заказ. Нажми /menu чтобы выбрать напиток.")
+
+async def show_menu(target: Union[Message, CallbackQuery], at: Airtable, page: int = 0):
+    items = await get_menu_items(at)
+    page_items, total = page_slice(items, page)
+    if not items:
+        text = "Меню пусто."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Корзина", callback_data="cart")]
+        ])
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=kb)
         else:
-            name, price = item, "0"
-        row.append(KeyboardButton(text=f"{name} ({price})"))
-        if len(row)==2:
-            rows.append(row); row=[]
-    if row: rows.append(row)
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+            await target.message.edit_text(text, reply_markup=kb)
+        return
+    for it in page_items:
+        caption = f"<b>{it['name']}</b>\n{it.get('descr','')}\n\nЦена: {it['price']:.2f}"
+        kb = item_kb(it["item_id"])
+        photo_url = it.get("photo") or ""
+        if photo_url:
+            if isinstance(target, Message):
+                await target.answer_photo(photo_url, caption=caption, reply_markup=kb)
+            else:
+                await target.message.answer_photo(photo_url, caption=caption, reply_markup=kb)
+        else:
+            if isinstance(target, Message):
+                await target.answer(caption, reply_markup=kb)
+            else:
+                await target.message.answer(caption, reply_markup=kb)
+    pager = pager_kb(page, total)
+    if isinstance(target, Message):
+        await target.answer(f"Стр. {page+1}", reply_markup=pager)
+    else:
+        await target.message.answer(f"Стр. {page+1}", reply_markup=pager)
 
-@dp.message(Command("start"))
-async def start(m: Message):
-    txt = ("Hello! This is an order bot.\n"
-           "Use `/order Name;Qty;Price`.\n"
-           "Example: `/order Americano;2;90`")
-    await m.answer(txt, reply_markup=menu_kb(), parse_mode="Markdown")
+async def on_page(cb: CallbackQuery, at: Airtable):
+    _, page_str = cb.data.split(":", 1)
+    page = int(page_str)
+    await cb.answer()
+    await show_menu(cb, at, page=page)
 
-@dp.message(Command("order"))
-async def order(m: Message):
-    text = m.text[len("/order"):].strip()
-    if text.startswith("@"):
-        text = text.split(" ",1)[1] if " " in text else ""
-    parts = [p.strip() for p in text.split(";")]
-    if len(parts)!=3:
-        return await m.reply("Format: /order Name;Qty;Price")
-    name, qty_s, price_s = parts
-    try:
-        qty=float(qty_s.replace(",",".")); price=float(price_s.replace(",","."))
-    except ValueError:
-        return await m.reply("Qty and Price must be numbers.")
-    total = round(qty*price,2)
-    rec = {"timestamp": datetime.datetime.utcnow().isoformat(),
-           "user_id": str(m.from_user.id), "item": name, "qty": qty, "price": price, "sum": total}
-    try:
-        sales_tbl.create(rec)
-    except Exception as e:
-        return await m.reply(f"Write error: {e}")
-    await m.reply(f"Order received: {name} × {qty} @ {price} = {total}")
-    if ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(ADMIN_CHAT_ID, f"New order: {rec}")
-        except Exception:
-            pass
+async def add_to_cart(cb: CallbackQuery, at: Airtable):
+    _, item_id = cb.data.split(":", 1)
+    items = await get_menu_items(at)
+    match = next((i for i in items if i["item_id"] == item_id), None)
+    if not match:
+        return await cb.answer("Товар не найден", show_alert=True)
+    user_cart = CART.setdefault(cb.from_user.id, {})
+    if item_id not in user_cart:
+        user_cart[item_id] = {"name": match["name"], "price": match["price"], "qty": 0}
+    user_cart[item_id]["qty"] += 1
+    await cb.answer(f"Добавлено: {match['name']}")
+    await cb.message.answer(
+        f"В корзине {match['name']}: {user_cart[item_id]['qty']} шт. (итого корзина {cart_total(user_cart):.2f})",
+        reply_markup=qty_kb(item_id)
+    )
 
-@dp.message(F.text)
-async def buttons(m: Message):
-    t=m.text.strip()
-    if "(" in t and t.endswith(")"):
-        name=t[:t.rfind("(")].strip()
-        price=t[t.rfind("(")+1:-1].strip()
-        m.text=f"/order {name};1;{price}"
-        return await order(m)
-    await m.reply("Use /order or preset buttons.")
+async def show_cart(cb: CallbackQuery):
+    user_cart = CART.get(cb.from_user.id, {})
+    if not user_cart:
+        return await cb.answer("Корзина пуста", show_alert=True)
+    lines = ["🧺 Корзина:"]
+    for v in user_cart.values():
+        lines.append(f"• {v['name']} × {v['qty']} = {v['price'] * v['qty']:.2f}")
+    lines.append(f"Итого: {cart_total(user_cart):.2f}")
+    actions = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♻️ Очистить", callback_data="cart:clear")],
+        [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout")],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")]
+    ])
+    await cb.message.edit_text("\n".join(lines), reply_markup=actions)
 
-# -------- Backup job (runs in background via schedule) --------
-def airtable_export_and_send():
-    day = datetime.date.today().isoformat()
-    tar_bytes = io.BytesIO()
-    with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
-        for tname in BACKUP_TABLES:
-            tbl = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, tname)
-            rows = tbl.all()
-            fields = sorted(set().union(*[r["fields"].keys() for r in rows])) if rows else []
-            csv_buf = io.StringIO()
-            w = csv.DictWriter(csv_buf, fieldnames=["id"]+fields)
-            w.writeheader()
-            for r in rows:
-                data={"id": r["id"]}; data.update(r["fields"]); w.writerow(data)
-            csv_bytes = csv_buf.getvalue().encode("utf-8")
-            info = tarfile.TarInfo(name=f"{day}/{tname}.csv"); info.size=len(csv_bytes)
-            tar.addfile(info, io.BytesIO(csv_bytes))
-            json_bytes = json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8")
-            info = tarfile.TarInfo(name=f"{day}/{tname}.json"); info.size=len(json_bytes)
-            tar.addfile(info, io.BytesIO(json_bytes))
-    tar_bytes.seek(0)
-    if ADMIN_CHAT_ID:
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-            files = {"document": ("airtable_backup_%s.tar.gz" % day, tar_bytes, "application/gzip")}
-            data = {"chat_id": ADMIN_CHAT_ID, "caption": f"Airtable backup {day}"}
-            requests.post(url, data=data, files=files, timeout=60)
-        except Exception as e:
-            print("Backup send failed:", e)
+async def qty_adjust(cb: CallbackQuery):
+    _, item_id = cb.data.split(":", 1)
+    user_cart = CART.get(cb.from_user.id, {})
+    if item_id not in user_cart:
+        return await cb.answer("Нет в корзине", show_alert=True)
+    user_cart[item_id]["qty"] += 1
+    await cb.answer("Добавлено")
+    await cb.message.edit_text(
+        f"В корзине {user_cart[item_id]['name']}: {user_cart[item_id]['qty']} шт.",
+        reply_markup=qty_kb(item_id)
+    )
 
-def schedule_parse(expr: str):
-    parts = expr.split()
-    if len(parts)==5 and parts[2]==parts[3]==parts[4]=="*":
-        return int(parts[1]), int(parts[0])
-    return 3,0
+async def qty_dec(cb: CallbackQuery):
+    _, item_id = cb.data.split(":", 1)
+    user_cart = CART.get(cb.from_user.id, {})
+    if item_id not in user_cart:
+        return await cb.answer("Нет в корзине", show_alert=True)
+    user_cart[item_id]["qty"] = max(0, user_cart[item_id]["qty"] - 1)
+    await cb.answer("Убрано")
+    await cb.message.edit_text(
+        f"В корзине {user_cart[item_id]['name']}: {user_cart[item_id]['qty']} шт.",
+        reply_markup=qty_kb(item_id)
+    )
 
-def run_scheduler():
-    h,m = schedule_parse(BACKUP_CRON)
-    schedule.every().day.at(f"{h:02d}:{m:02d}").do(airtable_export_and_send)
-    print(f"[scheduler] daily backup at {h:02d}:{m:02d}")
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+async def checkout(cb: CallbackQuery, at: Airtable):
+    user_cart = CART.get(cb.from_user.id, {})
+    if not user_cart:
+        return await cb.answer("Корзина пуста", show_alert=True)
+    total = cart_total(user_cart)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💵 Наличные", callback_data="pay:cash")
+    kb.button(text="📷 QR", callback_data="pay:qr")
+    kb.adjust(2)
+    await cb.message.edit_text(
+        f"Сумма к оплате: {total:.2f}. Выберите способ оплаты:",
+        reply_markup=kb.as_markup(),
+    )
+
+async def pay(cb: CallbackQuery, at: Airtable):
+    method = cb.data.split(":", 1)[1]
+    user_id = cb.from_user.id
+    cart = CART.get(user_id, {})
+    if not cart:
+        return await cb.answer("Корзина пуста", show_alert=True)
+    total = cart_total(cart)
+    client_rec_id = await ensure_client(
+        at, user_id, cb.from_user.full_name or "", cb.from_user.username or ""
+    )
+    for item_id, info in cart.items():
+        await create_sale(
+            at,
+            client_record_id=client_rec_id,
+            item_id=item_id,
+            quantity=info["qty"],
+            unit_price=info["price"],
+            total=info["price"] * info["qty"],
+            channel="Telegram",
+            payment_method="Cash" if method == "cash" else "QR",
+        )
+    if method == "cash":
+        provider = CashPayment()
+        res = await provider.create_invoice(f"order-{user_id}", total, "Оплата наличными")
+        CART[user_id] = {}
+        await cb.message.edit_text(f"Заказ оформлен. {res.description}\\nСумма: {total:.2f}")
+    else:
+        provider = QRStaticPayment("PAY")
+        res = await provider.create_invoice(f"order-{user_id}", total, "QR оплата")
+        CART[user_id] = {}
+        if res.qr_png:
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            tmp.write(res.qr_png); tmp.flush()
+            await cb.message.answer_photo(FSInputFile(tmp.name), caption=f"Отсканируйте QR. Сумма: {total:.2f}")
+        else:
+            await cb.message.edit_text("Оплата создана.")
+
+def h_on_start(at: Airtable):
+    async def _h(m: Message): return await on_start(m, at)
+    return _h
+def h_show_menu(at: Airtable):
+    async def _h(obj: Union[Message, CallbackQuery]): return await show_menu(obj, at, page=0)
+    return _h
+def h_page(at: Airtable):
+    async def _h(cb: CallbackQuery): return await on_page(cb, at)
+    return _h
+def h_add_to_cart(at: Airtable):
+    async def _h(cb: CallbackQuery): return await add_to_cart(cb, at)
+    return _h
+def h_checkout(at: Airtable):
+    async def _h(cb: CallbackQuery): return await checkout(cb, at)
+    return _h
+def h_pay(at: Airtable):
+    async def _h(cb: CallbackQuery): return await pay(cb, at)
+    return _h
 
 async def main():
-    import threading
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    bot = Bot(settings.BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher()
+    at = Airtable(settings.AIRTABLE_BASE_ID, settings.AIRTABLE_API_KEY)
+    dp.message.register(h_on_start(at), CommandStart())
+    dp.message.register(h_show_menu(at), Command("menu"))
+    dp.callback_query.register(h_show_menu(at), F.data == "menu")
+    dp.callback_query.register(h_page(at), F.data.startswith("page:"))
+    dp.callback_query.register(h_add_to_cart(at), F.data.startswith("add:"))
+    dp.callback_query.register(show_cart, F.data == "cart")
+    dp.callback_query.register(qty_adjust, F.data.startswith("qty:"))
+    dp.callback_query.register(qty_dec, F.data.startswith("dec:"))
+    dp.callback_query.register(h_checkout(at), F.data == "checkout")
+    dp.callback_query.register(h_pay(at), F.data.startswith("pay:"))
+    print("Bot started. Use /menu to test.")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
